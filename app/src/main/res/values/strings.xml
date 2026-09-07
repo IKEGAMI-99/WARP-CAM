@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">WARP CAM</string>
+    <string name="projection_notification_title">WARP CAM</string>
+    <string name="projection_notification_text">内部音声を解析中</string>
+</resources>
