@@ -12,11 +12,14 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Environment;
 import android.provider.MediaStore;
+import android.provider.Settings;
+import android.util.Size;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.PopupMenu;
 import android.widget.SeekBar;
@@ -28,8 +31,10 @@ import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.camera.core.CameraSelector;
+import androidx.camera.core.ImageAnalysis;
 import androidx.camera.core.ImageCapture;
 import androidx.camera.core.ImageCaptureException;
+import androidx.camera.core.ImageProxy;
 import androidx.camera.core.Preview;
 import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.camera.view.PreviewView;
@@ -48,14 +53,24 @@ import java.util.concurrent.Executors;
 
 public class MainActivity extends AppCompatActivity {
     private PreviewView previewView;
+    private ImageView liveWarpView;
     private ImageCapture imageCapture;
+    private ImageAnalysis imageAnalysis;
     private TextView audioStatus;
+    private TextView trackStatus;
     private TextView sensitivityLabel;
     private Button audioButton;
     private Button shutterButton;
+
     private float sensitivity = 1.0f;
     private boolean frontCamera = false;
+    private boolean livePreviewEnabled = true;
+    private boolean attachTrackInfo = true;
     private ExecutorService photoExecutor;
+    private ExecutorService previewExecutor;
+    private Bitmap liveBitmap;
+    private long lastLiveFrameNs = 0L;
+    private long lastTrackRefreshMs = 0L;
 
     private ActivityResultLauncher<String> cameraPermissionLauncher;
     private ActivityResultLauncher<String> audioPermissionLauncher;
@@ -74,6 +89,7 @@ public class MainActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         photoExecutor = Executors.newSingleThreadExecutor();
+        previewExecutor = Executors.newSingleThreadExecutor();
         registerLaunchers();
         buildUi();
         AppLog.i(this, "Main", "App started");
@@ -83,7 +99,14 @@ public class MainActivity extends AppCompatActivity {
         } else {
             cameraPermissionLauncher.launch(Manifest.permission.CAMERA);
         }
+        NowPlayingTracker.refreshAsync(this);
         uiHandler.post(meterUpdater);
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        NowPlayingTracker.refreshAsync(this);
     }
 
     private void registerLaunchers() {
@@ -144,14 +167,23 @@ public class MainActivity extends AppCompatActivity {
         root.addView(previewView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
+        liveWarpView = new ImageView(this);
+        liveWarpView.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        liveWarpView.setVisibility(View.INVISIBLE);
+        liveWarpView.setBackgroundColor(android.graphics.Color.BLACK);
+        root.addView(liveWarpView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
         LinearLayout top = new LinearLayout(this);
         top.setOrientation(LinearLayout.VERTICAL);
         top.setPadding(dp(18), dp(18), dp(18), dp(12));
         top.setBackgroundColor(0x66000000);
         TextView title = text("WARP CAM", 22f, true);
         audioStatus = text("AUDIO  OFF", 12f, false);
+        trackStatus = text("TRACK  --", 11f, false);
         top.addView(title);
         top.addView(audioStatus);
+        top.addView(trackStatus);
         root.addView(top, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP));
 
@@ -205,13 +237,31 @@ public class MainActivity extends AppCompatActivity {
     private void showMenu(View anchor) {
         PopupMenu menu = new PopupMenu(this, anchor);
         menu.getMenu().add(frontCamera ? "背面カメラに切替" : "前面カメラに切替");
+        menu.getMenu().add("ライブプレビュー: " + (livePreviewEnabled ? "ON" : "OFF"));
+        menu.getMenu().add("曲情報を写真に追加: " + (attachTrackInfo ? "ON" : "OFF"));
+        menu.getMenu().add("曲情報アクセス設定");
         menu.getMenu().add("アップデート確認");
         menu.getMenu().add("ログを書き出す");
         menu.setOnMenuItemClickListener(item -> {
             String title = item.getTitle().toString();
             if (title.contains("カメラに切替")) {
                 frontCamera = !frontCamera;
+                clearLivePreview();
                 startCamera();
+            } else if (title.startsWith("ライブプレビュー")) {
+                livePreviewEnabled = !livePreviewEnabled;
+                if (!livePreviewEnabled) clearLivePreview();
+                Toast.makeText(this, livePreviewEnabled ? "ライブプレビュー ON" : "ライブプレビュー OFF", Toast.LENGTH_SHORT).show();
+            } else if (title.startsWith("曲情報を写真")) {
+                attachTrackInfo = !attachTrackInfo;
+                Toast.makeText(this, attachTrackInfo ? "曲情報を写真に追加します" : "曲情報を追加しません", Toast.LENGTH_SHORT).show();
+            } else if (title.contains("曲情報アクセス")) {
+                try {
+                    startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS));
+                } catch (Exception e) {
+                    AppLog.e(this, "NowPlaying", "Could not open notification listener settings", e);
+                    Toast.makeText(this, "通知アクセス設定を開けませんでした", Toast.LENGTH_LONG).show();
+                }
             } else if (title.contains("アップデート")) {
                 UpdateManager.check(this);
             } else if (title.contains("ログ")) {
@@ -228,6 +278,7 @@ public class MainActivity extends AppCompatActivity {
             Intent stop = new Intent(this, AudioReactiveService.class);
             stop.setAction(AudioReactiveService.ACTION_STOP);
             startService(stop);
+            clearLivePreview();
             return;
         }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
@@ -249,12 +300,35 @@ public class MainActivity extends AppCompatActivity {
         audioButton.setText(active ? "AUDIO ON" : "AUDIO");
         if (!active) {
             audioStatus.setText("AUDIO  OFF");
+            if (liveWarpView != null && liveWarpView.getVisibility() == View.VISIBLE) clearLivePreview();
+        } else {
+            audioStatus.setText(String.format(Locale.US,
+                    "AUDIO %3d%%   BASS %3d   MID %3d   HIGH %3d",
+                    Math.round(a.intensity * 100), Math.round(a.bass * 100),
+                    Math.round(a.mid * 100), Math.round(a.treble * 100)));
+        }
+
+        long now = System.currentTimeMillis();
+        if (now - lastTrackRefreshMs > 2000L) {
+            lastTrackRefreshMs = now;
+            NowPlayingTracker.refreshAsync(this);
+        }
+        updateTrackUi();
+    }
+
+    private void updateTrackUi() {
+        if (trackStatus == null) return;
+        if (!NowPlayingTracker.hasNotificationAccess(this)) {
+            trackStatus.setText("TRACK  通知アクセス未許可");
             return;
         }
-        audioStatus.setText(String.format(Locale.US,
-                "AUDIO %3d%%   BASS %3d   MID %3d   HIGH %3d",
-                Math.round(a.intensity * 100), Math.round(a.bass * 100),
-                Math.round(a.mid * 100), Math.round(a.treble * 100)));
+        NowPlayingInfo track = NowPlayingStore.get();
+        if (!track.hasTrack()) {
+            trackStatus.setText("TRACK  曲情報なし");
+            return;
+        }
+        String artist = track.artist.isEmpty() ? "" : "  —  " + track.artist;
+        trackStatus.setText("TRACK  " + track.title + artist);
     }
 
     private void startCamera() {
@@ -268,15 +342,108 @@ public class MainActivity extends AppCompatActivity {
                         .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
                         .setJpegQuality(95)
                         .build();
+
+                imageAnalysis = new ImageAnalysis.Builder()
+                        .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                        .setTargetResolution(new Size(640, 480))
+                        .build();
+                imageAnalysis.setAnalyzer(previewExecutor, this::analyzeLiveFrame);
+
                 CameraSelector selector = frontCamera ? CameraSelector.DEFAULT_FRONT_CAMERA : CameraSelector.DEFAULT_BACK_CAMERA;
                 provider.unbindAll();
-                provider.bindToLifecycle(this, selector, preview, imageCapture);
-                AppLog.i(this, "Camera", "Camera bound front=" + frontCamera);
+                try {
+                    provider.bindToLifecycle(this, selector, preview, imageCapture, imageAnalysis);
+                    AppLog.i(this, "Camera", "Camera bound with live analysis front=" + frontCamera);
+                } catch (IllegalArgumentException liveFailure) {
+                    AppLog.e(this, "Camera", "Live analysis combination unsupported; falling back to normal preview", liveFailure);
+                    imageAnalysis.clearAnalyzer();
+                    provider.unbindAll();
+                    provider.bindToLifecycle(this, selector, preview, imageCapture);
+                    runOnUiThread(() -> Toast.makeText(this,
+                            "このカメラではライブ変形を併用できません", Toast.LENGTH_LONG).show());
+                }
             } catch (Exception e) {
                 AppLog.e(this, "Camera", "Camera bind failed", e);
                 Toast.makeText(this, "カメラを開始できません", Toast.LENGTH_LONG).show();
             }
         }, ContextCompat.getMainExecutor(this));
+    }
+
+    private void analyzeLiveFrame(@NonNull ImageProxy image) {
+        if (!livePreviewEnabled || !AudioAnalyzer.get().isRunning()) {
+            image.close();
+            return;
+        }
+
+        long now = System.nanoTime();
+        if (now - lastLiveFrameNs < 50_000_000L) {
+            image.close();
+            return;
+        }
+        lastLiveFrameNs = now;
+
+        Bitmap raw = null;
+        Bitmap oriented = null;
+        Bitmap warped = null;
+        try {
+            int rotation = image.getImageInfo().getRotationDegrees();
+            raw = image.toBitmap();
+            image.close();
+            image = null;
+
+            oriented = orientLiveBitmap(raw, rotation, frontCamera);
+            AudioSnapshot audio = AudioAnalyzer.get().getSnapshot();
+            warped = WarpProcessor.process(oriented, audio, sensitivity);
+
+            if (oriented != raw && raw != null && !raw.isRecycled()) raw.recycle();
+            if (oriented != null && !oriented.isRecycled()) oriented.recycle();
+
+            Bitmap finalWarped = warped;
+            runOnUiThread(() -> {
+                if (!livePreviewEnabled || !AudioAnalyzer.get().isRunning() || isFinishing() || isDestroyed()) {
+                    if (!finalWarped.isRecycled()) finalWarped.recycle();
+                    return;
+                }
+                Bitmap old = liveBitmap;
+                liveBitmap = finalWarped;
+                liveWarpView.setImageBitmap(finalWarped);
+                liveWarpView.setVisibility(View.VISIBLE);
+                if (old != null && old != finalWarped && !old.isRecycled()) old.recycle();
+            });
+        } catch (Throwable t) {
+            if (image != null) image.close();
+            if (warped != null && !warped.isRecycled()) warped.recycle();
+            if (oriented != null && !oriented.isRecycled()) oriented.recycle();
+            if (raw != null && !raw.isRecycled()) raw.recycle();
+            AppLog.e(this, "LivePreview", "Frame processing failed", t);
+        }
+    }
+
+    private Bitmap orientLiveBitmap(Bitmap bitmap, int rotationDegrees, boolean mirror) {
+        Bitmap current = bitmap;
+        if (rotationDegrees != 0) {
+            Matrix rotate = new Matrix();
+            rotate.postRotate(rotationDegrees);
+            current = Bitmap.createBitmap(current, 0, 0, current.getWidth(), current.getHeight(), rotate, true);
+        }
+        if (mirror) {
+            Matrix flip = new Matrix();
+            flip.preScale(-1f, 1f);
+            Bitmap mirrored = Bitmap.createBitmap(current, 0, 0, current.getWidth(), current.getHeight(), flip, true);
+            if (current != bitmap && !current.isRecycled()) current.recycle();
+            current = mirrored;
+        }
+        return current;
+    }
+
+    private void clearLivePreview() {
+        if (liveWarpView == null) return;
+        liveWarpView.setVisibility(View.INVISIBLE);
+        liveWarpView.setImageDrawable(null);
+        Bitmap old = liveBitmap;
+        liveBitmap = null;
+        if (old != null && !old.isRecycled()) old.recycle();
     }
 
     private void capture() {
@@ -286,39 +453,60 @@ public class MainActivity extends AppCompatActivity {
         ImageCapture.OutputFileOptions options = new ImageCapture.OutputFileOptions.Builder(temp).build();
         AudioSnapshot capturedAudio = AudioAnalyzer.get().getSnapshot();
         float capturedSensitivity = sensitivity;
+        NowPlayingInfo capturedTrack = attachTrackInfo
+                ? NowPlayingStore.snapshotForCapture()
+                : NowPlayingInfo.empty();
 
         imageCapture.takePicture(options, photoExecutor, new ImageCapture.OnImageSavedCallback() {
             @Override
             public void onImageSaved(@NonNull ImageCapture.OutputFileResults outputFileResults) {
+                Bitmap raw = null;
+                Bitmap oriented = null;
+                Bitmap warped = null;
+                Bitmap finalBitmap = null;
                 try {
-                    Bitmap raw = BitmapFactory.decodeFile(temp.getAbsolutePath());
+                    raw = BitmapFactory.decodeFile(temp.getAbsolutePath());
                     if (raw == null) throw new IllegalStateException("Bitmap decode failed");
-                    Bitmap oriented = applyExifOrientation(raw, temp);
-                    Bitmap warped = WarpProcessor.process(oriented, capturedAudio, capturedSensitivity);
-                    String saved = saveBitmap(warped);
+                    oriented = applyExifOrientation(raw, temp);
+                    warped = WarpProcessor.process(oriented, capturedAudio, capturedSensitivity);
+                    finalBitmap = TrackStripRenderer.append(warped, capturedTrack);
+                    String saved = saveBitmap(finalBitmap);
                     AppLog.i(MainActivity.this, "Capture",
-                            "Saved=" + saved + " intensity=" + capturedAudio.intensity + " sensitivity=" + capturedSensitivity);
-                    if (oriented != raw) raw.recycle();
-                    if (warped != oriented) oriented.recycle();
-                    warped.recycle();
-                    temp.delete();
+                            "Saved=" + saved + " intensity=" + capturedAudio.intensity +
+                                    " sensitivity=" + capturedSensitivity +
+                                    " track=" + capturedTrack.title + " artist=" + capturedTrack.artist);
+
+                    if (finalBitmap != warped && finalBitmap != null && !finalBitmap.isRecycled()) finalBitmap.recycle();
+                    if (warped != null && !warped.isRecycled()) warped.recycle();
+                    if (oriented != null && !oriented.isRecycled()) oriented.recycle();
+                    if (raw != null && raw != oriented && !raw.isRecycled()) raw.recycle();
+
                     runOnUiThread(() -> {
                         shutterButton.setEnabled(true);
+                        String trackSuffix = capturedTrack.hasTrack() ? "  ♪ " + capturedTrack.title : "";
                         Toast.makeText(MainActivity.this,
-                                "WARPED  " + Math.round(capturedAudio.intensity * 100) + "%", Toast.LENGTH_SHORT).show();
+                                "WARPED  " + Math.round(capturedAudio.intensity * 100) + "%" + trackSuffix,
+                                Toast.LENGTH_SHORT).show();
                     });
                 } catch (Exception e) {
+                    if (finalBitmap != null && finalBitmap != warped && !finalBitmap.isRecycled()) finalBitmap.recycle();
+                    if (warped != null && !warped.isRecycled()) warped.recycle();
+                    if (oriented != null && !oriented.isRecycled()) oriented.recycle();
+                    if (raw != null && raw != oriented && !raw.isRecycled()) raw.recycle();
                     AppLog.e(MainActivity.this, "Capture", "Processing/saving failed", e);
-                    temp.delete();
                     runOnUiThread(() -> {
                         shutterButton.setEnabled(true);
                         Toast.makeText(MainActivity.this, "保存に失敗しました", Toast.LENGTH_LONG).show();
                     });
+                } finally {
+                    capturedTrack.recycleArtwork();
+                    temp.delete();
                 }
             }
 
             @Override
             public void onError(@NonNull ImageCaptureException exception) {
+                capturedTrack.recycleArtwork();
                 AppLog.e(MainActivity.this, "Capture", "CameraX capture failed", exception);
                 temp.delete();
                 runOnUiThread(() -> {
@@ -402,7 +590,10 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         uiHandler.removeCallbacks(meterUpdater);
+        clearLivePreview();
+        if (imageAnalysis != null) imageAnalysis.clearAnalyzer();
         if (photoExecutor != null) photoExecutor.shutdownNow();
+        if (previewExecutor != null) previewExecutor.shutdownNow();
         super.onDestroy();
     }
 }
