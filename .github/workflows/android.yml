@@ -43,30 +43,17 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '9.6.0'
-      - name: Validate signing secrets
-        env:
-          KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
-          STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
-        run: |
-          test -n "$KEYSTORE_B64" || (echo "Missing SIGNING_KEYSTORE_BASE64" && exit 1)
-          test -n "$STORE_PASSWORD" || (echo "Missing SIGNING_STORE_PASSWORD" && exit 1)
-          test -n "$KEY_ALIAS" || (echo "Missing SIGNING_KEY_ALIAS" && exit 1)
-          test -n "$KEY_PASSWORD" || (echo "Missing SIGNING_KEY_PASSWORD" && exit 1)
-      - name: Restore release keystore
-        env:
-          KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+      - name: Restore fixed personal release keystore
         run: |
           mkdir -p .signing
-          echo "$KEYSTORE_B64" | base64 --decode > .signing/warp-cam-release.jks
+          base64 --decode signing/warp-cam-release.jks.b64 > .signing/warp-cam-release.jks
           test -s .signing/warp-cam-release.jks
       - name: Build signed release APK
         env:
           ANDROID_SIGNING_STORE_FILE: ${{ github.workspace }}/.signing/warp-cam-release.jks
-          ANDROID_SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
-          ANDROID_SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
-          ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+          ANDROID_SIGNING_STORE_PASSWORD: warp-cam-release
+          ANDROID_SIGNING_KEY_ALIAS: warp-cam
+          ANDROID_SIGNING_KEY_PASSWORD: warp-cam-release
         run: gradle :app:assembleRelease --stacktrace
       - name: Verify APK exists and is signed
         run: |
