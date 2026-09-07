@@ -11,6 +11,11 @@ on:
 permissions:
   contents: write
 
+env:
+  WARP_STORE_PASSWORD: warp-cam-release
+  WARP_KEY_ALIAS: warp-cam
+  WARP_KEY_PASSWORD: warp-cam-release
+
 jobs:
   verify:
     if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
@@ -24,12 +29,29 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '9.6.0'
-      - name: Build debug APK
-        run: gradle :app:assembleDebug --stacktrace
+      - name: Restore fixed personal release keystore
+        run: |
+          mkdir -p .signing
+          base64 --decode signing/warp-cam-release.jks.b64 > .signing/warp-cam-release.jks
+          test -s .signing/warp-cam-release.jks
+      - name: Build signed release APK
+        env:
+          ANDROID_SIGNING_STORE_FILE: ${{ github.workspace }}/.signing/warp-cam-release.jks
+          ANDROID_SIGNING_STORE_PASSWORD: ${{ env.WARP_STORE_PASSWORD }}
+          ANDROID_SIGNING_KEY_ALIAS: ${{ env.WARP_KEY_ALIAS }}
+          ANDROID_SIGNING_KEY_PASSWORD: ${{ env.WARP_KEY_PASSWORD }}
+        run: gradle :app:assembleRelease --stacktrace
+      - name: Verify signed APK
+        run: |
+          APK="app/build/outputs/apk/release/app-release.apk"
+          test -s "$APK"
+          TOOL="$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -1)"
+          test -n "$TOOL"
+          "$TOOL" verify --verbose --print-certs "$APK"
       - uses: actions/upload-artifact@v4
         with:
-          name: warp-cam-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: warp-cam-release
+          path: app/build/outputs/apk/release/app-release.apk
 
   release:
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
@@ -51,9 +73,9 @@ jobs:
       - name: Build signed release APK
         env:
           ANDROID_SIGNING_STORE_FILE: ${{ github.workspace }}/.signing/warp-cam-release.jks
-          ANDROID_SIGNING_STORE_PASSWORD: warp-cam-release
-          ANDROID_SIGNING_KEY_ALIAS: warp-cam
-          ANDROID_SIGNING_KEY_PASSWORD: warp-cam-release
+          ANDROID_SIGNING_STORE_PASSWORD: ${{ env.WARP_STORE_PASSWORD }}
+          ANDROID_SIGNING_KEY_ALIAS: ${{ env.WARP_KEY_ALIAS }}
+          ANDROID_SIGNING_KEY_PASSWORD: ${{ env.WARP_KEY_PASSWORD }}
         run: gradle :app:assembleRelease --stacktrace
       - name: Verify APK exists and is signed
         run: |
