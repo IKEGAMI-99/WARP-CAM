@@ -14,6 +14,10 @@ android {
         versionName = "0.1.0"
     }
 
+    buildFeatures {
+        buildConfig = true
+    }
+
     signingConfigs {
         create("release") {
             val signingStore = System.getenv("ANDROID_SIGNING_STORE_FILE")
