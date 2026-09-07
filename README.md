@@ -15,29 +15,19 @@
 - `Pictures/WarpCam` へのJPEG保存
 - GitHub Releasesを使ったアプリ内アップデート
 - 永続ログ + SAFログ書き出し。空ログでも診断ヘッダを書き込むため0Bになりません
-- タグ `v*` で署名済みRelease APKを生成してGitHub Releaseへ公開
+- mainでは毎回署名済みRelease APKをActions artifactとして生成
+- タグ `v*` で同じ署名のRelease APKをGitHub Releaseへ公開
 
 ## 内部音声
 
 Android 10（API 29）以降が対象です。内部音声を開始するとAndroid標準のMediaProjection許可画面が出ます。キャプチャ元アプリがAudio Playback Captureを禁止している場合、その音は取得できません。
 
-## Release署名の初回設定
+## Release署名
 
-署名鍵は公開リポジトリへコミットしません。更新インストールを成立させるには、以後すべて同じ鍵で署名します。
+個人利用向けに、固定のRelease署名鍵をリポジトリ内へBase64形式で保持しています。GitHub Secretsの初期設定は不要です。
 
-```bash
-export WARP_STORE_PASSWORD='任意の強いパスワード'
-export WARP_KEY_PASSWORD='任意の強いパスワード'
-./scripts/create-signing-key.sh
-```
+`main` へpushするとActionsが同じ鍵で署名したRelease APKを生成します。
 
-GitHubの `Settings > Secrets and variables > Actions` に以下を登録します。
+`versionCode` / `versionName` を更新して `v0.1.1` のようなタグをpushすると、Actionsが署名済み `warp-cam-release.apk` をGitHub Releaseへ公開します。アプリの「アップデート確認」はこのReleaseを検出してAPKを取得します。
 
-- `SIGNING_KEYSTORE_BASE64`
-- `SIGNING_STORE_PASSWORD`
-- `SIGNING_KEY_ALIAS` (`warpcam`)
-- `SIGNING_KEY_PASSWORD`
-
-`versionCode` / `versionName` を更新して `v0.1.1` のようなタグをpushすると、Actionsが署名済み `warp-cam-release.apk` をReleaseへ公開します。アプリの「アップデート確認」はこのReleaseを検出してAPKを取得します。
-
-Release鍵を失うと既存アプリへ更新できません。鍵が漏れると第三者が正規更新として通るAPKを作れるため、`.jks` は公開リポジトリへ置かないでください。
+この方式は個人利用の手軽さを優先しています。公開リポジトリに署名材料が含まれるため、配布用・商用アプリでは使用しないでください。
